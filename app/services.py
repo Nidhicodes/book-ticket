@@ -4,9 +4,15 @@ from . import models, schemas
 from fastapi import HTTPException, status
 
 def get_events(db: Session):
+    """
+    Retrieves a list of all events, including their seats.
+    """
     return db.query(models.Event).options(subqueryload(models.Event.seats)).all()
 
 def create_event(db: Session, event: schemas.EventCreate):
+    """
+    Creates a new event and generates its seats.
+    """
     db_event = models.Event(
         name=event.name,
         venue=event.venue,
@@ -24,55 +30,74 @@ def create_event(db: Session, event: schemas.EventCreate):
     return db_event
 
 def create_booking(db: Session, booking: schemas.BookingCreate):
-    event = db.query(models.Event).filter(models.Event.id == booking.event_id).first()
-    if not event:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
-
-    available_seat_query = db.query(models.Seat).filter(
-        models.Seat.event_id == booking.event_id,
-        models.Seat.id.notin_(
-            db.query(models.Booking.seat_id).filter(
-                models.Booking.event_id == booking.event_id,
-                models.Booking.status == 'active'
-            )
+    """
+    Creates a booking for a user for an event. If a seat_number is provided,
+    it books that specific seat. If not, it attempts to find any available seat.
+    If the event is full, it adds the user to the waitlist.
+    """
+    seat_to_book = None
+    if booking.seat_number:
+        query = db.query(models.Seat).filter(
+            models.Seat.event_id == booking.event_id,
+            models.Seat.seat_number == booking.seat_number
         )
-    )
+        if db.bind.dialect.name == 'postgresql':
+            query = query.with_for_update()
+        seat_to_book = query.first()
 
-    if db.bind.dialect.name == 'postgresql':
-        available_seat_query = available_seat_query.with_for_update(of=models.Seat)
+        if not seat_to_book:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Seat not found for this event")
+    else:
+        all_seats = db.query(models.Seat).filter(models.Seat.event_id == booking.event_id).all()
+        if not all_seats:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No seats found for this event")
 
-    available_seat = available_seat_query.first()
+        booked_seat_ids = db.query(models.Booking.seat_id).filter(
+            models.Booking.event_id == booking.event_id,
+            models.Booking.status == 'active'
+        ).all()
+        booked_seat_ids = {seat_id for (seat_id,) in booked_seat_ids}
 
-    if available_seat:
-        db_booking = models.Booking(
-            user_id=booking.user_id,
-            event_id=booking.event_id,
-            seat_id=available_seat.id
-        )
-        db.add(db_booking)
+        seat_to_book = next((seat for seat in all_seats if seat.id not in booked_seat_ids), None)
+
+    if not seat_to_book:
+        waitlist_entry = db.query(models.WaitlistEntry).filter(
+            models.WaitlistEntry.user_id == booking.user_id,
+            models.WaitlistEntry.event_id == booking.event_id
+        ).first()
+
+        if waitlist_entry:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="You are already on the waitlist for this event.")
+
+        new_waitlist_entry = models.WaitlistEntry(user_id=booking.user_id, event_id=booking.event_id)
+        db.add(new_waitlist_entry)
         db.commit()
-        db.refresh(db_booking)
-        return db_booking
+        db.refresh(new_waitlist_entry)
+        raise HTTPException(status_code=status.HTTP_202_ACCEPTED, detail="Event is full. You have been added to the waitlist.")
 
-    existing_waitlist = db.query(models.WaitlistEntry).filter(
-        models.WaitlistEntry.user_id == booking.user_id,
-        models.WaitlistEntry.event_id == booking.event_id
+    existing_booking = db.query(models.Booking).filter(
+        models.Booking.seat_id == seat_to_book.id,
+        models.Booking.status == 'active'
     ).first()
 
-    if existing_waitlist:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User is already on the waitlist for this event")
+    if existing_booking:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Seat is already booked")
 
-    db_waitlist_entry = models.WaitlistEntry(
+    db_booking = models.Booking(
         user_id=booking.user_id,
-        event_id=booking.event_id
+        event_id=booking.event_id,
+        seat_id=seat_to_book.id
     )
-    db.add(db_waitlist_entry)
+    db.add(db_booking)
     db.commit()
-    db.refresh(db_waitlist_entry)
-    raise HTTPException(status_code=status.HTTP_202_ACCEPTED, detail="Event is full. You have been added to the waitlist.")
+    db.refresh(db_booking)
+    return db_booking
 
 def cancel_booking(db: Session, booking_id: int, user_id: int):
-    db_booking = db.query(models.Booking).options(joinedload(models.Booking.event)).filter(
+    """
+    Cancels a booking by marking its status as 'cancelled'. This frees the seat implicitly.
+    """
+    db_booking = db.query(models.Booking).filter(
         models.Booking.id == booking_id,
         models.Booking.user_id == user_id,
         models.Booking.status == 'active'
@@ -81,27 +106,14 @@ def cancel_booking(db: Session, booking_id: int, user_id: int):
     if not db_booking:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Active booking not found for this user")
 
-    event_id = db_booking.event_id
-    event_name = db_booking.event.name
     db_booking.status = 'cancelled'
-
-    waitlist_entry = db.query(models.WaitlistEntry).filter(
-        models.WaitlistEntry.event_id == event_id
-    ).order_by(models.WaitlistEntry.created_at.asc()).first()
-
-    if waitlist_entry:
-        notification = models.Notification(
-            user_id=waitlist_entry.user_id,
-            message=f"A spot has opened up for the event: '{event_name}'. You can now try to book it again."
-        )
-        db.add(notification)
-
-        db.delete(waitlist_entry)
-
     db.commit()
-    return {"detail": "Booking canceled successfully and notification sent if applicable."}
+    return {"detail": "Booking canceled successfully"}
 
 def get_user_bookings(db: Session, user_id: int):
+    """
+    Retrieves all active bookings for a specific user, including event and seat details.
+    """
     bookings = db.query(models.Booking).options(
         joinedload(models.Booking.event),
         joinedload(models.Booking.seat)
@@ -112,22 +124,32 @@ def get_user_bookings(db: Session, user_id: int):
     return bookings
 
 def get_user_notifications(db: Session, user_id: int):
-    return db.query(models.Notification).filter(models.Notification.user_id == user_id).order_by(models.Notification.created_at.desc()).all()
+    """
+    Retrieves all notifications for a specific user.
+    """
+    return db.query(models.Notification).filter(models.Notification.user_id == user_id).all()
 
 def get_user_waitlist_entries(db: Session, user_id: int):
+    """
+    Retrieves all waitlist entries for a specific user.
+    """
     return db.query(models.WaitlistEntry).filter(models.WaitlistEntry.user_id == user_id).all()
 
 def remove_from_waitlist(db: Session, waitlist_entry_id: int, user_id: int):
-    db_waitlist_entry = db.query(models.WaitlistEntry).filter(
+    """
+    Removes a user's entry from the waitlist.
+    """
+    waitlist_entry = db.query(models.WaitlistEntry).filter(
         models.WaitlistEntry.id == waitlist_entry_id,
         models.WaitlistEntry.user_id == user_id
     ).first()
 
-    if not db_waitlist_entry:
+    if not waitlist_entry:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Waitlist entry not found for this user")
 
-    db.delete(db_waitlist_entry)
+    db.delete(waitlist_entry)
     db.commit()
+    return {"detail": "Successfully removed from waitlist"}
 
 def update_event(db: Session, event_id: int, event_update: schemas.EventCreate):
     db_event = db.query(models.Event).filter(models.Event.id == event_id).first()

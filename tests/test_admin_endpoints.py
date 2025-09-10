@@ -35,7 +35,7 @@ def test_update_event_details_by_admin(client: TestClient, db: Session):
             "venue": "Updated Venue",
             "start_time": "2025-01-01T10:00:00",
             "end_time": "2025-01-01T12:00:00",
-            "total_seats": 5
+            "total_seats": 10
         }
     )
     assert response.status_code == 200
@@ -50,11 +50,13 @@ def test_delete_event_with_no_bookings(client: TestClient, db: Session):
         f"/admin/events/{event.id}",
         headers={"X-User-Role": "admin"}
     )
-    assert response.status_code == 204
+    assert response.status_code == 200
+    assert response.json()["detail"] == "Event deleted successfully"
+
 
 def test_cannot_delete_event_with_active_bookings(client: TestClient, db: Session):
     event = services.create_event(db, schemas.EventCreate(name="Event with Booking", venue="Venue", start_time="2025-01-01T10:00:00", end_time="2025-01-01T12:00:00", total_seats=1))
-    client.post("/bookings", json={"user_id": 1, "event_id": event.id})
+    services.create_booking(db, schemas.BookingCreate(user_id=1, event_id=event.id, seat_number="Seat-1"))
 
     response = client.delete(
         f"/admin/events/{event.id}",
@@ -63,9 +65,10 @@ def test_cannot_delete_event_with_active_bookings(client: TestClient, db: Sessio
     assert response.status_code == 400
     assert response.json()["detail"] == "Cannot delete event with active bookings"
 
+
 def test_get_analytics_with_seat_data(client: TestClient, db: Session):
     event = services.create_event(db, schemas.EventCreate(name="Analytics Event", venue="Venue", start_time="2025-01-01T10:00:00", end_time="2025-01-01T12:00:00", total_seats=10))
-    client.post("/bookings", json={"user_id": 1, "event_id": event.id})
+    services.create_booking(db, schemas.BookingCreate(user_id=1, event_id=event.id, seat_number="Seat-1"))
 
     response = client.get(
         "/admin/analytics",

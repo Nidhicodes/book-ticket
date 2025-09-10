@@ -1,6 +1,7 @@
 import datetime as dt
 from pydantic import BaseModel, ConfigDict
-from typing import List
+from typing import List, Optional
+
 class SeatBase(BaseModel):
     seat_number: str
 
@@ -23,10 +24,10 @@ class UserCreate(UserBase):
     role: str = 'user'
 
 class EventCreate(EventBase):
-    total_seats: int 
+    total_seats: int
 
 class BookingCreate(BookingBase):
-    pass
+    seat_number: Optional[str] = None
 
 class Seat(SeatBase):
     id: int

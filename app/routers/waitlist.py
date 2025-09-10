@@ -1,15 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 from typing import List
 
-from .. import services, schemas, models
-from ..database import get_db
-from ..dependencies import get_current_user
+from app import services, schemas
+from app.database import get_db
+from app.dependencies import get_current_user
 
 router = APIRouter(
     prefix="/waitlists",
-    tags=["waitlists"],
-    responses={404: {"description": "Not found"}},
+    tags=["Waitlist"],
 )
 
 @router.get("/me", response_model=List[schemas.WaitlistEntry])
